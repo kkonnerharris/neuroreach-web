@@ -216,6 +216,66 @@
     }
   }
 
+
+  // ---- local app: OpenCV runs in the Python server (sim/look_camera.py) -------------------
+  // Python's OpenCV opens the webcam and does the vision; this panel shows its annotated feed
+  // and sends each look to the game. The browser build of OpenCV (10 MB) is only the fallback
+  // for the static web edition, which has no server.
+  const NATIVE = !document.documentElement.classList.contains("web-edition");
+  let nPoll = null, nSeq = null, nOn = false;
+  async function lookApi(action, body) {
+    const r = await fetch(`/api/look/${action}`, body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    return j;
+  }
+  function showFeed(on) {
+    const img = $("#hc-img");
+    $("#hc-view").hidden = on; img.hidden = !on;
+    img.src = on ? `/api/look/stream?t=${Date.now()}` : "";
+  }
+  async function startNative() {
+    $("#headcam").hidden = false;
+    $("#head-btn").classList.add("on");
+    syncSwap();
+    status("Opening your webcam with OpenCV…", "loading"); calibBar(0.1);
+    let st;
+    try {
+      await lookApi("swap", { swap });
+      st = await lookApi("start", {});
+    } catch (err) { status(`Couldn't start the camera: ${err.message}`, "error"); return; }
+    nOn = true; nSeq = st.seq;
+    window.NR_headOn = true;
+    window.dispatchEvent(new Event("headcontrol"));
+    let streaming = false;
+    nPoll = setInterval(async () => {
+      let s;
+      try { s = await lookApi("state"); } catch { return; }
+      if (!nOn) return;
+      status(s.status, s.state);
+      calibBar(s.state === "calib" ? s.calib : 1);
+      light(s.yaw <= -s.threshold ? "left" : s.yaw >= s.threshold ? "right" : null);
+      if (s.on && !streaming) { streaming = true; showFeed(true); }
+      if (!s.on) streaming = false;
+      if (s.seq > nSeq && s.dir) {
+        const el = document.querySelector(`#hc-arrows [data-dir="${s.dir}"]`);
+        el?.classList.add("fire"); setTimeout(() => el?.classList.remove("fire"), 600);
+        window.NR_headCommand?.(MAP[s.dir], s.dir);
+      }
+      nSeq = s.seq;
+    }, 100);
+  }
+  function stopNative() {
+    nOn = false;
+    clearInterval(nPoll); nPoll = null;
+    showFeed(false);
+    lookApi("stop", {}).catch(() => {});
+    window.NR_headOn = false;
+    window.dispatchEvent(new Event("headcontrol"));
+    $("#headcam").hidden = true;
+    $("#head-btn").classList.remove("on");
+  }
+
   // automated checks: feed a still image instead of the camera
   window.NR_headDebug = {
     loadOpenCV, ready: () => !!frontal && !frontal.empty() && !!profile && !profile.empty(),
@@ -223,14 +283,19 @@
     track(img, dx, now) { wctx.fillStyle = "#000"; wctx.fillRect(0, 0, W, H); wctx.drawImage(img, dx, 0, W, H); const h = detect(); if (h) track(h, now); return { hit: h, yaw, base, armed }; },
   };
   document.addEventListener("click", (e) => {
-    if (e.target.closest("#head-btn")) (running || !$("#headcam").hidden ? stop : start)();
-    if (e.target.closest("#hc-close")) stop();
-    if (e.target.closest("#hc-recal")) recalibrate();
+    if (e.target.closest("#head-btn")) {
+      const open = !$("#headcam").hidden;
+      if (NATIVE) (open ? stopNative : startNative)(); else (running || open ? stop : start)();
+    }
+    if (e.target.closest("#hc-close")) (NATIVE ? stopNative : stop)();
+    if (e.target.closest("#hc-recal")) { if (NATIVE) lookApi("recal", {}).catch(() => {}); else recalibrate(); }
     if (e.target.closest("#hc-swap")) {
       swap = !swap; yaw = 0;
       try { localStorage.setItem("nr-head-swap", swap ? "1" : "0"); } catch {}
       syncSwap();
-      if (base) status(swap ? "Sides swapped. Look left or right." : "Sides normal. Look left or right.", "ready");
+      if (NATIVE) lookApi("swap", { swap }).catch(() => {});
+      else if (base) status(swap ? "Sides swapped. Look left or right." : "Sides normal. Look left or right.", "ready");
     }
   });
+  window.addEventListener("pagehide", () => { if (nOn) navigator.sendBeacon?.("/api/look/stop", new Blob(["{}"], { type: "application/json" })); });
 })();
